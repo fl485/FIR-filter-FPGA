@@ -82,18 +82,20 @@ architecture rtl of top is
     );
     
     type t_rx_state is (
-        S_WAIT_HEADER,
-        S_WAIT_MSB,
-        S_WAIT_LSB,
-        S_FIR_CALC
+        S_RX_WAIT_HEADER,
+        S_RX_WAIT_MSB,
+        S_RX_WAIT_LSB,
+        S_RX_MAC,
+        S_RX_SEND,
+        S_RX_PUSH_HDR,
+        S_RX_PUSH_MSB,
+        S_RX_PUSH_LSB
     );
-    signal r_rx_state : t_rx_state := S_WAIT_HEADER;
+    signal r_rx_state : t_rx_state := S_RX_WAIT_HEADER;
 
     type t_tx_state is (
         S_TX_IDLE,
-        S_TX_LOAD,
-        S_TX_WAIT_BUSY,
-        S_TX_WAIT_DONE
+        S_TX_WAIT_BUSY
     );
     signal r_tx_state : t_tx_state := S_TX_IDLE;
 
@@ -105,18 +107,23 @@ architecture rtl of top is
     signal r_packet_index  : std_logic_vector(7 downto 0) := (others => '0');
     signal r_sample_msb    : std_logic_vector(6 downto 0) := (others => '0');
     signal r_result        : unsigned(13 downto 0) := (others => '0');
+    signal r_mac_index     : integer range 0 to c_n_stages - 1 := 0;
 
     signal r_out_byte      : std_logic_vector(7 downto 0) := (others => '0');
-    signal w_out_send      : std_logic := '0';
+    signal r_out_send      : std_logic := '0';
 
     signal w_in_byte_valid : std_logic := '0';
     signal r_in_byte       : std_logic_vector(7 downto 0) := (others => '0');
-
+    
     signal w_tx_ready      : std_logic := '0';
 
-    signal w_tx_start      : std_logic := '0';
-    signal r_tx_count      : integer range 0 to 2 := 0;
-
+    -- fifo between p_rx (writer) and p_tx (reader)
+    signal r_fifo_wr       : std_logic := '0';                                
+    signal r_fifo_wr_data  : std_logic_vector(7 downto 0) := (others => '0'); 
+    signal r_fifo_rd       : std_logic := '0';                                
+    signal w_fifo_rd_data  : std_logic_vector(7 downto 0);
+    signal w_fifo_full     : std_logic;
+    signal w_fifo_empty    : std_logic;
     signal r_active_coeffs : t_coeff_set ;
 begin
 
@@ -127,7 +134,7 @@ begin
         port map (
             i_clock => i_clock,
             i_reset => i_btnC,
-            i_valid => w_out_send,
+            i_valid => r_out_send,
             i_data  => r_out_byte,
             o_tx    => o_uart_tx,
             o_ready => w_tx_ready
@@ -139,12 +146,28 @@ begin
         )
         port map (
             i_clock       => i_clock,
-            i_reset       => i_btnC,
+            i_reset       => i_btnC,    
             i_rx          => i_uart_rx,
             o_data        => r_in_byte, -- packets in form 1sssssss 0ppppppp 0ppppppp where 's' is index and 'p' is data
             o_rx_valid    => w_in_byte_valid,
             o_rx_ready    => open,
             o_frame_error => open
+        );
+
+    u_fifo : entity work.fifo
+        generic map (
+            g_depth => 16,
+            g_width => 8
+        )
+        port map (
+            i_clock   => i_clock,
+            i_reset   => i_btnC,
+            i_wr_en   => r_fifo_wr,
+            i_wr_data => r_fifo_wr_data,
+            o_full    => w_fifo_full,
+            i_rd_en   => r_fifo_rd,
+            o_rd_data => w_fifo_rd_data,
+            o_empty   => w_fifo_empty
         );
 
     p_presets: process (i_clock)
@@ -162,30 +185,32 @@ begin
         variable v_scaled : signed(c_acc_width - 1 downto 0);
     begin
         if rising_edge(i_clock) then
+            r_fifo_wr <= '0';   
             if i_btnC = '1' then
-                w_tx_start <= '0';
-                r_rx_state <= S_WAIT_HEADER;
-                r_samples <= (others => (others => '0'));
-                r_result <= (others => '0');
+                r_rx_state        <= S_RX_WAIT_HEADER;
+                r_samples      <= (others => (others => '0'));
+                r_result       <= (others => '0');
+                r_mac_index    <= 0;
+                r_fifo_wr_data <= (others => '0');
             else
                 case r_rx_state is
-                    when S_WAIT_HEADER =>
+                    when S_RX_WAIT_HEADER =>
                         if w_in_byte_valid = '1' and r_in_byte(7) = '1' then
                             r_packet_index <= r_in_byte;
-                            r_rx_state <= S_WAIT_MSB;
+                            r_rx_state <= S_RX_WAIT_MSB;
                         end if;
 
-                    when S_WAIT_MSB =>
+                    when S_RX_WAIT_MSB =>
                         if w_in_byte_valid = '1' then
                             if  r_in_byte(7) = '0' then
                                 r_sample_msb <= r_in_byte(6 downto 0);
-                                r_rx_state <= S_WAIT_LSB;
+                                r_rx_state <= S_RX_WAIT_LSB;
                             else
                                 r_packet_index <= r_in_byte;
                             end if;
                         end if;
 
-                    when S_WAIT_LSB =>
+                    when S_RX_WAIT_LSB =>
                         if w_in_byte_valid = '1' then
                             if  r_in_byte(7) = '0' then
                                 r_samples(0) <= signed('0' & r_sample_msb & r_in_byte(6 downto 0));
@@ -193,22 +218,29 @@ begin
                                 for i in 1 to (c_n_stages - 1) loop
                                     r_samples(i) <= r_samples(i - 1);
                                 end loop;
+
+                                v_sum := (others => '0');
+                                r_mac_index <= 0;
                                 
-                                r_rx_state <= S_FIR_CALC;
+                                r_rx_state <= S_RX_MAC;
                             else
                                 r_packet_index <= r_in_byte;
-                                r_rx_state <= S_WAIT_MSB;
+                                r_rx_state <= S_RX_WAIT_MSB;
                             end if;
                         end if;
 
-                    when S_FIR_CALC =>
-                        v_sum := (others => '0');
-                        
-                        for i in 0 to (c_n_stages - 1) loop
-                            v_sum := v_sum + resize(r_samples(i) * r_active_coeffs(i), c_acc_width);
-                        end loop;
-                        
-                        v_scaled := shift_right(v_sum, c_frac_bits);
+                    when S_RX_MAC =>
+                        v_sum := v_sum + resize(r_samples(r_mac_index) * r_active_coeffs(r_mac_index), c_acc_width);
+                        if r_mac_index = c_n_stages - 1 then
+                            r_mac_index <= 0;
+                            r_rx_state <= S_RX_SEND;
+                        else
+                            r_mac_index <= r_mac_index + 1;
+                        end if;
+                    
+                    when S_RX_SEND =>
+                        -- rounding
+                        v_scaled := shift_right(v_sum + to_signed(2**(c_frac_bits-1), c_acc_width), c_frac_bits);
                         
                         -- saturation logic
                         if v_scaled < 0 then
@@ -218,8 +250,31 @@ begin
                         else
                             r_result <= unsigned(v_scaled(13 downto 0));
                         end if;
-                        w_tx_start <= '1';
-                        r_rx_state <= S_WAIT_HEADER;
+
+                        r_rx_state <= S_RX_PUSH_HDR;
+
+                    --- push into FIFO
+                    when S_RX_PUSH_HDR =>
+                        if w_fifo_full = '0' then
+                            r_fifo_wr_data <= r_packet_index;
+                            r_fifo_wr      <= '1';
+                            r_rx_state     <= S_RX_PUSH_MSB;
+                        end if;
+
+                    when S_RX_PUSH_MSB =>
+                        if w_fifo_full = '0' then
+                            r_fifo_wr_data <= std_logic_vector('0' & r_result(13 downto 7));
+                            r_fifo_wr      <= '1';
+                            r_rx_state     <= S_RX_PUSH_LSB;
+                        end if;
+
+                    when S_RX_PUSH_LSB =>
+                        if w_fifo_full = '0' then
+                            r_fifo_wr_data <= std_logic_vector('0' & r_result(6 downto 0));
+                            r_fifo_wr      <= '1';
+                            r_rx_state     <= S_RX_WAIT_HEADER;
+                        end if;
+
                 end case;
             end if;
         end if;
@@ -228,47 +283,26 @@ begin
     p_tx : process (i_clock)
     begin
         if rising_edge(i_clock) then
-            w_out_send <= '0';
+            r_out_send <= '0';
+            r_fifo_rd  <= '0';
             if i_btnC = '1' then
                 r_tx_state <= S_TX_IDLE;
                 r_out_byte <= (others => '0');
-                r_tx_count <= 0;
             else
                 case r_tx_state is
                     when S_TX_IDLE =>
-                        if w_tx_start = '1' then
-                            r_tx_state <= S_TX_LOAD;
-                        end if;
-                    
-                    when S_TX_LOAD =>
-                        if w_tx_ready = '1' then
-                            case r_tx_count is
-                                when 0 =>
-                                    r_out_byte <= r_packet_index;
-                                when 1 =>
-                                    r_out_byte <= std_logic_vector('0' & r_result(13 downto 7));
-                                when 2 =>
-                                    r_out_byte <= std_logic_vector('0' & r_result(6 downto 0));
-                            end case;
-                            w_out_send <= '1';
+                        if w_fifo_empty = '0' and w_tx_ready = '1' then
+                            r_out_byte <= w_fifo_rd_data;  
+                            r_out_send <= '1';
+                            r_fifo_rd  <= '1';            
                             r_tx_state <= S_TX_WAIT_BUSY;
                         end if;
-                    
+
                     when S_TX_WAIT_BUSY =>
-                        if w_tx_ready = '0' then
-                            r_tx_state <= S_TX_WAIT_DONE;
-                        end if;
-                    
-                    when S_TX_WAIT_DONE =>
-                    if w_tx_ready = '1' then
-                        if r_tx_count = 2 then
-                            r_tx_count <= 0;
+                        if w_tx_ready = '0' then        
                             r_tx_state <= S_TX_IDLE;
-                        else
-                            r_tx_count <= r_tx_count + 1;
-                            r_tx_state <= S_TX_LOAD;
                         end if;
-                    end if;
+
                 end case;
             end if;
         end if;
